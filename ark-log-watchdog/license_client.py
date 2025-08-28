@@ -1,159 +1,204 @@
-"""
-Client-side licensing for ARK Watchdog.
+# license_client.py
+# Drop-in client that caches the signed token under %APPDATA%\ArkWatchdog\license_cache.json
+# and supports activate(), require_valid(), get_cached_claims().
 
-- Canonical machine id = first 16 hex of SHA256( lower(hostname) + '|' + lower(mac) )
-- Can validate an already-cached token (offline), or activate online to fetch one.
-- Exposes the legacy helpers your GUI expects:
-    - require_valid(allow_online=False, license_key=None, timeout=20) -> (ok: bool, msg: str)
-    - activate(license_key: str, timeout=20) -> (ok: bool, msg: str)
-    - get_cached_claims() -> dict | None
-    - clear_cached_token() -> None
-
-Replace PUBLIC_KEY_PEM with your server's PUBLIC key.
-"""
-
-from __future__ import annotations
-import os, json, time, hashlib, platform, uuid
-from typing import Optional, Tuple, Dict, Any
+import os
+import json
+import time
+import platform
+import hashlib
+from pathlib import Path
+from typing import Tuple, Optional, Dict
 
 import requests
-import jwt
-from jwt import ExpiredSignatureError, InvalidSignatureError, InvalidAudienceError, DecodeError
 
-# ----------------- CONFIG -----------------
-API_BASE = "https://api.license-arkwatchdog.com"
-APP_ID   = "ark-watchdog"
+try:
+    import jwt  # PyJWT
+except Exception as e:
+    jwt = None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CONFIG — set API_BASE and PUBLIC_PEM (keep your existing PUBLIC_PEM!)
+# ────────────────────────────────────────────────────────────────────────────────
+
+API_BASE = os.environ.get("LW_API_BASE", "https://api.license-arkwatchdog.com").rstrip("/")
 
 # ======= PASTE YOUR SERVER PUBLIC KEY HERE =======
 # Paste your *public* RSA key (from public.pem) here:
 PUBLIC_KEY_PEM = b""""""
 # ================================================
 
-# ----------------- MACHINE FP (canonical 16) -----------------
-def machine_fingerprint() -> str:
-    name = (platform.node() or "").strip().lower()
-    mac  = f"{uuid.getnode():012x}".lower()
-    h = hashlib.sha256(f"{name}|{mac}".encode("utf-8")).hexdigest()
-    return h[:16]
+APP_NAME = "ark-watchdog"
+TOKEN_LEEWAY = 60  # seconds of clock skew allowed
 
-# ----------------- TOKEN CACHE -----------------
-def _cache_dir() -> str:
-    # Windows-friendly local app data; fallback to home folder
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "ArkWatchdog")
-    os.makedirs(d, exist_ok=True)
-    return d
+# ────────────────────────────────────────────────────────────────────────────────
+# Cache file location: %APPDATA%\ArkWatchdog\license_cache.json (Windows)
+#                      ~/.ark_watchdog/ArkWatchdog/license_cache.json (others)
+# ────────────────────────────────────────────────────────────────────────────────
 
-def _token_path() -> str:
-    return os.path.join(_cache_dir(), "license_token.json")
+def _cache_path() -> Path:
+    base = os.environ.get("APPDATA")
+    if not base:
+        base = str(Path.home() / ".ark_watchdog")
+    cache_dir = Path(base) / "ArkWatchdog"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "license_cache.json"
 
-def save_cached_token(token: str) -> None:
-    data = {"token": token, "saved_at": int(time.time())}
-    tmp = _token_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, _token_path())
+def _read_cache() -> Dict:
+    p = _cache_path()
+    if p.exists():
+        try:
+            return json.load(open(p, "r", encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
-def load_cached_token() -> Optional[str]:
-    p = _token_path()
-    if not os.path.exists(p):
-        return None
+def _write_cache(data: Dict) -> None:
+    p = _cache_path()
     try:
-        data = json.load(open(p, "r", encoding="utf-8"))
-        return data.get("token")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception:
-        return None
-
-def clear_cached_token() -> None:
-    try:
-        os.remove(_token_path())
-    except FileNotFoundError:
         pass
 
-def get_cached_claims() -> Optional[Dict[str, Any]]:
-    tok = load_cached_token()
-    if not tok:
-        return None
+# ────────────────────────────────────────────────────────────────────────────────
+# Fingerprint (Windows: MachineGuid; fallback to system tuple)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _win_machine_guid() -> Optional[str]:
     try:
-        # decode without verify just to show details
-        return jwt.decode(tok, options={"verify_signature": False})
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+            return str(guid)
     except Exception:
         return None
 
-# ----------------- CORE VERIFY / ACTIVATE -----------------
-def _verify_token_strict(token: str) -> Dict[str, Any]:
-    """Verify signature, audience, time; then enforce canonical machine match."""
-    claims = jwt.decode(
-        token,
-        PUBLIC_KEY_PEM,
-        algorithms=["RS256"],
-        audience=APP_ID,
-        options={"require": ["exp", "aud", "nbf", "iat"]},
-    )
-    local_m = machine_fingerprint()
-    token_m = ((claims.get("machine") or "")).lower()[:16]
-    if token_m != local_m:
-        raise RuntimeError(f"server token mismatch: token.machine={token_m} local.machine={local_m}")
-    if int(claims["exp"]) < int(time.time()):
-        raise ExpiredSignatureError("expired")
-    return claims
+def machine_fingerprint() -> str:
+    guid = None
+    if platform.system().lower().startswith("win"):
+        guid = _win_machine_guid()
+    node = platform.node()
+    sysname = platform.system()
+    release = platform.release()
+    arch = platform.machine()
+    src = "|".join([guid or "", node, sysname, release, arch])
+    return hashlib.sha256(src.encode("utf-8", "ignore")).hexdigest()
 
-def activate_and_get_token(license_key: str, timeout: int = 20) -> str:
-    m = machine_fingerprint()
-    r = requests.post(
-        f"{API_BASE}/api/activate",
-        json={"key": license_key, "machine": m, "app": APP_ID},
-        timeout=timeout,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"activate failed {r.status_code}: {r.text}")
-    return r.json()["token"]
+# ────────────────────────────────────────────────────────────────────────────────
+# JWT helpers
+# ────────────────────────────────────────────────────────────────────────────────
 
-# ----------------- LEGACY HELPERS (GUI expects these) -----------------
-def require_valid(allow_online: bool = False,
-                  license_key: Optional[str] = None,
-                  timeout: int = 20) -> Tuple[bool, str]:
-    """
-    Check cached token first. If invalid and allow_online=True + license_key provided,
-    try to activate and cache a fresh token.
-    """
-    # 1) try cached token
-    tok = load_cached_token()
-    if tok:
-        try:
-            claims = _verify_token_strict(tok)
-            exp_human = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(claims["exp"])))
-            return True, f"VALID — plan={claims.get('plan','?')} expires={exp_human}"
-        except (ExpiredSignatureError,) as e:
-            # fall through to online if allowed
-            if not allow_online:
-                return False, "Token expired. Re-activate required."
-        except (InvalidSignatureError, InvalidAudienceError, DecodeError, RuntimeError) as e:
-            if not allow_online:
-                return False, f"Invalid token: {e}"
-
-    # 2) go online if allowed
-    if allow_online and license_key:
-        try:
-            tok = activate_and_get_token(license_key, timeout=timeout)
-            save_cached_token(tok)
-            _ = _verify_token_strict(tok)  # sanity
-            return True, "Activated and valid."
-        except Exception as e:
-            return False, f"Activation failed: {e}"
-
-    # 3) no cached valid token and didn't (or couldn't) go online
-    return False, "No valid license token found."
-
-def activate(license_key: str, timeout: int = 20) -> Tuple[bool, str]:
-    """
-    Online-only explicit activation. Saves token if success.
-    """
+def _decode_token(token: str) -> Tuple[bool, str, Optional[Dict]]:
+    if not jwt:
+        return False, "pyjwt not installed", None
     try:
-        tok = activate_and_get_token(license_key, timeout=timeout)
-        save_cached_token(tok)
-        claims = _verify_token_strict(tok)
-        exp_human = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(claims["exp"])))
-        return True, f"Activated — plan={claims.get('plan','?')} expires={exp_human}"
+        claims = jwt.decode(
+            token,
+            PUBLIC_PEM,
+            algorithms=["RS256"],
+            options={"require": ["exp", "iat"]},
+            leeway=TOKEN_LEEWAY,
+        )
+        return True, "ok", claims
     except Exception as e:
-        return False, f"Activation failed: {e}"
+        return False, f"token decode failed: {e}", None
+
+def _claims_valid_for_this_machine(claims: Dict) -> Tuple[bool, str]:
+    if not claims:
+        return False, "no claims"
+    if claims.get("app") != APP_NAME:
+        return False, f"token for different app: {claims.get('app')}"
+    # exp checked by jwt.decode; also check not in the past with leeway already applied
+    fp = claims.get("fp")
+    if not fp:
+        return False, "token missing fingerprint"
+    if fp != machine_fingerprint():
+        return False, "fingerprint mismatch"
+    active = claims.get("active", True)
+    if not active:
+        return False, "license inactive"
+    return True, "ok"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Public API
+# ────────────────────────────────────────────────────────────────────────────────
+
+def get_cached_claims() -> Optional[Dict]:
+    """Return cached claims if token present and decodable (even if expired)."""
+    cache = _read_cache()
+    tok = cache.get("token")
+    if not tok:
+        return None
+    ok, _, claims = _decode_token(tok)
+    return claims if ok and claims else cache.get("claims")
+
+def activate(license_key: str, timeout: int = 15) -> Tuple[bool, str]:
+    """Activate online with entered license key; cache token+claims+key on success."""
+    if not license_key:
+        return False, "no license key entered"
+    fp = machine_fingerprint()
+    try:
+        resp = requests.post(
+            f"{API_BASE}/activate",
+            json={"key": license_key, "fingerprint": fp, "app": APP_NAME, "version": 1},
+            timeout=timeout,
+        )
+    except Exception as e:
+        return False, f"network error: {e}"
+
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"detail": resp.text}
+        return False, f"server {resp.status_code}: {data}"
+
+    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    token = data.get("token")
+    claims = data.get("claims") or {}
+
+    if not token:
+        return False, "server did not return token"
+
+    ok, msg, dec = _decode_token(token)
+    if not ok:
+        return False, f"bad token: {msg}"
+    ok2, msg2 = _claims_valid_for_this_machine(dec)
+    if not ok2:
+        return False, msg2
+
+    cache = _read_cache()
+    cache.update({
+        "token": token,
+        "claims": dec,         # store decoded claims (authoritative)
+        "license_key": license_key,
+        "last_verified_unix": int(time.time()),
+    })
+    _write_cache(cache)
+    return True, "activation ok"
+
+def require_valid(allow_online: bool = False, license_key: Optional[str] = None, timeout: int = 12) -> Tuple[bool, str]:
+    """
+    Validate cached token. If invalid/expired and allow_online=True, attempt online
+    activation/refresh using provided license_key or cached license_key.
+    """
+    cache = _read_cache()
+    tok = cache.get("token")
+    if tok:
+        ok, msg, claims = _decode_token(tok)
+        if ok and claims:
+            ok2, msg2 = _claims_valid_for_this_machine(claims)
+            if ok2:
+                # still valid
+                return True, "cached token valid"
+            # else fall through to possible online refresh
+
+    if not allow_online:
+        return False, "no valid token cached (offline)"
+
+    # Try online with provided or cached key
+    key = (license_key or cache.get("license_key") or "").strip()
+    if not key:
+        return False, "no license key available for online check"
+    return activate(key, timeout=timeout)
