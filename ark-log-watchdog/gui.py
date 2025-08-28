@@ -13,6 +13,7 @@ import numpy as np
 from mss import mss
 from PIL import Image, ImageTk
 import customtkinter as ctk
+from bundled_tesseract import use_bundled_tesseract
 
 import license_client
 
@@ -235,6 +236,8 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.cfg = load_config()
+        # Prefer a bundled Tesseract if present (sets cfg["tesseract_cmd"] automatically)
+        use_bundled_tesseract(self.cfg)
         self.proc: Optional[subprocess.Popen] = None
         self.reader_thread: Optional[threading.Thread] = None
         self.stop_reader = threading.Event()
@@ -662,6 +665,13 @@ class App(ctk.CTk):
             # Force UTF-8 from child; never crash on weird bytes
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            # Ensure child sees bundled Tesseract (if present)
+            # Ensure child sees the tessdata directory if we’re using a bundled exe
+            if self.cfg.get("tesseract_cmd"):
+                tdir = os.path.dirname(self.cfg["tesseract_cmd"])
+                env.setdefault("TESSDATA_PREFIX", tdir)
+                # Optional: put Tesseract folder at front of PATH so any tools that rely on PATH also work
+                env["PATH"] = tdir + os.pathsep + env.get("PATH", "")
 
             self.proc = subprocess.Popen(
                 cmd,

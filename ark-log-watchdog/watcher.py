@@ -12,7 +12,7 @@ from utils import load_config, load_keywords
 from ocr import set_tesseract_cmd, ocr_lines, ocr_entry_fulltext
 from line_detector import build_regexes, match_line
 from discord_notifier import send_to_discord
-
+from bundled_tesseract import use_bundled_tesseract
 import license_client
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -133,6 +133,16 @@ def main():
         raise SystemExit(f"[LICENSE] Not valid: {msg}")
 
     cfg = load_config()
+    # Prefer bundled Tesseract if available
+    use_bundled_tesseract(cfg)
+
+    # Also honor explicit path from config for pytesseract (if your code uses pytesseract directly)
+    try:
+        import pytesseract
+        if cfg.get("tesseract_cmd"):
+            pytesseract.pytesseract.tesseract_cmd = cfg["tesseract_cmd"]
+    except Exception:
+        pass
     tess_path = (cfg.get("tesseract_cmd") or "").strip()
     if tess_path:
         set_tesseract_cmd(tess_path)
