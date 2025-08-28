@@ -2,7 +2,8 @@ import os
 import sys
 import yaml
 import json
-import locale
+import time
+import traceback
 import threading
 import subprocess
 import tkinter as tk
@@ -397,6 +398,16 @@ class App(ctk.CTk):
                      text_color="#6f8296").grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(0,12))
 
     # Populate
+    def _license_cache_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "license_cache.json")
+
+    def _save_last_key(self, key: str) -> None:
+        try:
+            with open(self._license_cache_path(), "w", encoding="utf-8") as f:
+                json.dump({"license_key": key}, f, indent=2)
+        except Exception:
+            pass
+
     def _populate_from_cfg(self):
         c = self.cfg
         self.webhook_var.set(c.get("discord_webhook_url",""))
@@ -419,7 +430,7 @@ class App(ctk.CTk):
 
         # Prefill license key from cache if present
         try:
-            cache_path = os.path.join(os.path.dirname(__file__), "license_cache.json")
+            cache_path = self._license_cache_path()
             if os.path.exists(cache_path):
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cache = json.load(f)
@@ -429,7 +440,7 @@ class App(ctk.CTk):
             pass
 
         # Initial license status (gates Start button)
-        self._on_check_license()
+        self._on_check_license(startup=True)
 
     # Triggers UI helpers
     def _refresh_trigger_list(self):
@@ -513,21 +524,48 @@ class App(ctk.CTk):
     # License helpers
     def _set_license_status(self, ok: bool, msg: str):
         color = "#00ffc3" if ok else "#ff7a7a"
-        self.lic_status.configure(text=f"License: {'VALID' if ok else 'INVALID'} — {msg}", text_color=color)
+        # enrich with plan/expiry if available
+        details = ""
+        claims = license_client.get_cached_claims() or {}
+        if ok and claims:
+            exp = claims.get("exp")
+            plan = claims.get("plan", "?")
+            exp_h = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "?"
+            details = f" — plan={plan} exp={exp_h}"
+        self.lic_status.configure(text=f"License: {'VALID' if ok else 'INVALID'} — {msg}{details}", text_color=color)
         self.btn_start.configure(state=("normal" if ok else "disabled"))
 
-    def _on_check_license(self):
-        ok, msg = license_client.require_valid(allow_online=False)
-        if not ok:
-            ok, msg = license_client.require_valid(allow_online=True)
+    def _on_check_license(self, startup: bool = False):
+        """Check cached token; if invalid and a key is present, auto-activate online."""
+        key = (self.lic_var.get() or "").strip()
+        self._append_log("[LIC] Checking cached license…\n")
+        try:
+            ok, msg = license_client.require_valid(allow_online=False)
+            if not ok and key:
+                self._append_log("[LIC] No valid token; attempting online activation with entered key…\n")
+                ok, msg = license_client.require_valid(allow_online=True, license_key=key)
+                if ok:
+                    self._save_last_key(key)
+        except Exception as e:
+            ok, msg = False, f"Check failed: {e}\n{traceback.format_exc(limit=1)}"
+        self._append_log(f"[LIC] {msg}\n")
         self._set_license_status(ok, msg)
-        if not ok:
-            # don't modal spam at startup; only show dialog if user clicked "Check"
-            pass
+        if (not startup) and (not ok):
+            messagebox.showwarning("License", msg)
 
     def _on_activate_license(self):
         key = self.lic_var.get().strip()
-        ok, msg = license_client.activate_and_store(key)
+        if not key:
+            messagebox.showwarning("License", "Enter a license key first.")
+            return
+        self._append_log("[LIC] Activating…\n")
+        try:
+            ok, msg = license_client.activate(key, timeout=20)
+            if ok:
+                self._save_last_key(key)
+        except Exception as e:
+            ok, msg = False, f"Activation failed: {e}\n{traceback.format_exc(limit=1)}"
+        self._append_log(f"[LIC] {msg}\n")
         self._set_license_status(ok, msg)
         if ok:
             messagebox.showinfo("License", "Activation successful.")
@@ -583,8 +621,13 @@ class App(ctk.CTk):
             self._stop_watcher()
 
     def _start_watcher(self):
-        # LICENSE GATE
-        ok, msg = license_client.require_valid(allow_online=True)
+        # LICENSE GATE: prefer cached; if invalid and key present, try online
+        key = (self.lic_var.get() or "").strip()
+        ok, msg = license_client.require_valid(allow_online=False)
+        if not ok and key:
+            ok, msg = license_client.require_valid(allow_online=True, license_key=key)
+            if ok:
+                self._save_last_key(key)
         if not ok:
             self._set_license_status(False, msg)
             messagebox.showerror("License", f"Not valid: {msg}")
