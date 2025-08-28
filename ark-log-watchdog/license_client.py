@@ -1,101 +1,82 @@
-# license_client.py
-import os, json, time, uuid, hashlib, platform
-from typing import Tuple, Optional, Dict, Any
+"""
+Client-side licensing for ARK Watchdog.
+
+- Computes a canonical machine fingerprint: 16-char lowercase hex of SHA256(hostname|mac)
+- Activates against your server to receive a JWT
+- Verifies JWT signature (RS256), audience, exp
+- Compares canonical machine id from token vs local
+
+Replace PUBLIC_KEY_PEM with your server's PUBLIC key (PEM).
+"""
+
+import time
+import platform, uuid, hashlib
 import requests
-import jwt  # PyJWT
-from datetime import datetime, timezone
+import jwt
+from jwt import ExpiredSignatureError, InvalidAudienceError, InvalidSignatureError
 
-APP_ID = "ark-watchdog"
+API_BASE = "https://api.license-arkwatchdog.com"
+APP_ID   = "ark-watchdog"
 
-# POINT THIS TO YOUR LICENSE SERVER (no trailing slash)
-API_BASE = "https://api.license-arkwatchdog.com"  # e.g. https://license.example.com
-
+# ======= PASTE YOUR SERVER PUBLIC KEY HERE =======
 # Paste your *public* RSA key (from public.pem) here:
 PUBLIC_KEY_PEM = b""""""
+# ================================================
 
-CACHE_PATH = os.path.join(os.path.dirname(__file__), "license_cache.json")
+def machine_fingerprint() -> str:
+    """Canonical machine id: 16-char lowercase hex."""
+    name = (platform.node() or "").strip().lower()
+    mac  = f"{uuid.getnode():012x}".lower()
+    h = hashlib.sha256(f"{name}|{mac}".encode("utf-8")).hexdigest()
+    return h[:16]
 
+def activate_and_get_token(license_key: str, timeout: int = 20) -> str:
+    m = machine_fingerprint()
+    r = requests.post(
+        f"{API_BASE}/api/activate",
+        json={"key": license_key, "machine": m, "app": APP_ID},
+        timeout=timeout,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"activate failed {r.status_code}: {r.text}")
+    return r.json()["token"]
 
-def _load_cache() -> Dict[str, Any]:
-    if not os.path.exists(CACHE_PATH): return {}
-    try:
-        with open(CACHE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_cache(data: Dict[str, Any]) -> None:
-    with open(CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-def _machine_fingerprint() -> str:
-    # Stable-ish identifier (deterrent, not bulletproof)
-    node = platform.node()
-    sys = platform.system()
-    rel = platform.release()
-    proc = platform.processor()
-    mac = uuid.getnode()
-    raw = f"{node}|{sys}|{rel}|{proc}|{mac}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-def _verify_token(token: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    try:
-        claims = jwt.decode(token, PUBLIC_KEY_PEM, algorithms=["RS256"], audience=APP_ID)
-    except Exception as e:
-        return False, f"invalid token: {e}", None
-    fp = _machine_fingerprint()
-    if claims.get("machine") != fp:
-        return False, "token machine mismatch", None
-    if claims.get("sub") != APP_ID:
-        return False, "token subject mismatch", None
-    # exp/nbf are validated by jwt.decode
-    return True, "ok", claims
-
-def check_local() -> Tuple[bool, str]:
-    c = _load_cache()
-    token = c.get("token")
-    if not token:
-        return False, "no token cached"
-    ok, msg, _ = _verify_token(token)
-    return ok, msg
-
-def activate_and_store(license_key: str) -> Tuple[bool, str]:
+def validate_token(token: str) -> dict:
     """
-    Call your license server to activate a key for this machine.
-    On success, caches {license_key, token} in license_cache.json.
+    Verify signature/audience/exp and ensure the token's machine matches the local canonical id.
+    Raises a clear RuntimeError on machine mismatch.
     """
-    if not license_key:
-        return False, "empty license key"
-    fp = _machine_fingerprint()
-    url = f"{API_BASE}/api/activate"
-    try:
-        resp = requests.post(url, json={"key": license_key, "machine": fp, "app": APP_ID}, timeout=12)
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("token")
-        if not token:
-            return False, "server returned no token"
-        ok, msg, claims = _verify_token(token)
-        if not ok:
-            return False, f"server token failed verify: {msg}"
-        cache = {"license_key": license_key, "token": token, "activated_at": int(time.time())}
-        _save_cache(cache)
-        return True, f"activated; expires {datetime.fromtimestamp(claims['exp'], tz=timezone.utc).isoformat()}"
-    except Exception as e:
-        return False, f"activate failed: {e}"
+    # Verify signature + audience + time claims
+    claims = jwt.decode(
+        token,
+        PUBLIC_KEY_PEM,
+        algorithms=["RS256"],
+        audience=APP_ID,
+        options={"require": ["exp", "aud", "nbf", "iat"]},
+    )
 
-def require_valid(allow_online: bool = True) -> Tuple[bool, str]:
-    """
-    Ensure there is a valid token. If local token is invalid/expired and
-    allow_online=True, tries to refresh using the cached license_key.
-    """
-    ok, msg = check_local()
-    if ok:
-        return True, "valid (cached)"
-    if not allow_online:
-        return False, f"license not valid (cached): {msg}"
-    cache = _load_cache()
-    key = cache.get("license_key")
-    if not key:
-        return False, "no license key; please activate"
-    return activate_and_store(key)
+    local_m = machine_fingerprint()
+    token_m = ((claims.get("machine") or "")).lower()[:16]
+    if token_m != local_m:
+        raise RuntimeError(f"server token mismatch: token.machine={token_m} local.machine={local_m}")
+
+    if int(claims["exp"]) < int(time.time()):
+        raise ExpiredSignatureError("expired")
+
+    return claims
+
+# Optional: tiny CLI for quick testing
+if __name__ == "__main__":
+    import sys, json
+    if len(sys.argv) == 2 and sys.argv[1] == "--fingerprint":
+        print(json.dumps({"fingerprint": machine_fingerprint()}, indent=2))
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--activate":
+        key = sys.argv[2]
+        tok = activate_and_get_token(key)
+        print("token:", tok[:32]+"...")  # preview
+        print("claims:", jwt.decode(tok, options={"verify_signature": False}))
+        sys.exit(0)
+    print("Usage:")
+    print("  python license_client.py --fingerprint")
+    print("  python license_client.py --activate <LICENSE_KEY>")
