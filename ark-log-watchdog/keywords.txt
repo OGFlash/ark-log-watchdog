@@ -1,0 +1,8 @@
+raid
+offline
+destroyed
+public
+private
+froze
+claimed
+unclaimed

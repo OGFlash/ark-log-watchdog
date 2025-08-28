@@ -1,0 +1,70 @@
+# --- Python basics
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Virtual envs
+.venv/
+venv/
+env/
+
+# --- OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE / tooling
+.vscode/
+.idea/
+*.code-workspace
+
+# --- App runtime outputs
+logs/
+*.log
+tmp/
+temp/
+cache/
+out/
+captures/
+screenshots/
+debug/
+*.tmp
+
+# --- Config with user secrets (webhooks, paths, keys)
+# Keep a safe template in the repo as: config.example.yaml
+config.yaml
+
+# --- Licensing client cache (if you store token locally)
+*.license*.json
+token*.json
+
+# --- PyInstaller / build artifacts
+build/
+dist/
+*.spec
+
+# --- Nuitka artifacts
+*.build/
+*.dist/
+.nuitka-cache/
+
+# --- PyArmor artifacts
+obf/
+pyarmor_runtime_*
+
+# --- OCR/training data (large, optional to commit)
+# If you keep a portable Tesseract next to the app, don't commit it.
+# (Bundle it at build time with PyInstaller.)
+tesseract/
+
+# --- Binary blobs you don’t want in git by accident
+*.exe
+*.dll
+*.so
+*.dylib

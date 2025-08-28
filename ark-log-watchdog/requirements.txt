@@ -1,0 +1,11 @@
+mss
+opencv-python
+pillow
+pytesseract
+numpy
+python-dotenv
+PyYAML
+customtkinter
+requests 
+pyjwt 
+cryptography
