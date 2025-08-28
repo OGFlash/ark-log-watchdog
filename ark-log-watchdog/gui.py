@@ -1,14 +1,13 @@
+# gui.py  —  Single-EXE runtime: GUI spawns itself with --watcher
 import os
 import sys
 import yaml
 import json
-import time
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Dict, Any, Optional, List
-from pathlib import Path
 
 import numpy as np
 from mss import mss
@@ -18,9 +17,17 @@ import customtkinter as ctk
 import license_client
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Try to import watcher so PyInstaller bundles it. (We still launch a child proc)
+# ────────────────────────────────────────────────────────────────────────────────
+try:
+    import watcher as _watcher_module
+    _HAS_WATCHER_MODULE = True
+except Exception:
+    _HAS_WATCHER_MODULE = False
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Config I/O
 # ────────────────────────────────────────────────────────────────────────────────
-
 CONFIG_PATH = os.path.join(os.getcwd(), "config.yaml")
 
 DEFAULT_CFG = {
@@ -35,13 +42,13 @@ DEFAULT_CFG = {
     ],
     # Allowed mentions for webhook posts
     "discord_allowed_mentions": {
-        "everyone": True,
-        "roles": True,
-        "users": False,
+        "everyone": True,   # enables @here/@everyone
+        "roles": True,      # enables <@&ROLE_ID>
+        "users": False,     # enables <@USER_ID>
         "role_ids": [],
         "user_ids": [],
     },
-    # Legacy
+    # Legacy (still supported by watcher as fallback)
     "keywords": ["destroyed", "killed", "tribe", "tribemember", "raid", "offline", "froze"],
     "regex_patterns": [
         "(?i)killed|destroyed|froze|raid(ed)?|offline",
@@ -61,36 +68,6 @@ DEFAULT_CFG = {
     "capture_interval_ms": 750,
     "send_only_newest": True,
 }
-
-def _app_dir() -> str:
-    """Folder where the GUI executable/script lives (works for frozen EXE or .py)."""
-    if getattr(sys, "frozen", False):  # PyInstaller / frozen
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-def _find_watcher_cmd() -> tuple[list[str], str, str]:
-    """
-    Return (cmd_list, run_cwd, note) to launch watcher using the best available method.
-    1) watcher.exe next to GUI
-    2) watcher.py next to GUI
-    3) python -m watcher with PYTHONPATH set to app dir
-    4) watcher.py in current working directory (legacy fallback)
-    """
-    appdir = _app_dir()
-    exe_path = os.path.join(appdir, "watcher.exe")
-    py_path  = os.path.join(appdir, "watcher.py")
-    cwd_py   = os.path.join(os.getcwd(), "watcher.py")
-
-    if os.path.exists(exe_path):
-        return ([exe_path], appdir, "using bundled watcher.exe")
-
-    if os.path.exists(py_path):
-        return ([sys.executable, py_path], appdir, "using watcher.py next to GUI")
-
-    # try module mode: python -m watcher, with PYTHONPATH including appdir
-    return ([sys.executable, "-m", "watcher"], appdir, "using python -m watcher (PYTHONPATH patched)") \
-        if os.path.exists(os.path.join(appdir, "watcher.py")) \
-        else ([sys.executable, cwd_py], os.getcwd(), "using watcher.py in CWD (fallback)")
 
 def load_config() -> Dict[str, Any]:
     if not os.path.exists(CONFIG_PATH):
@@ -120,46 +97,44 @@ def save_config(cfg: Dict[str, Any]) -> None:
         messagebox.showerror("Config error", f"Failed to write config.yaml:\n{e}")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Shared license cache path (same as license_client)
+# Helpers: app dir & watcher command (single-EXE)
 # ────────────────────────────────────────────────────────────────────────────────
+def _app_dir() -> str:
+    """Folder of the running app (handles PyInstaller and script)."""
+    if getattr(sys, "frozen", False):  # PyInstaller onefile
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-def _license_cache_path() -> str:
-    base = os.environ.get("APPDATA")
-    if not base:
-        base = str(Path.home() / ".ark_watchdog")
-    cache_dir = Path(base) / "ArkWatchdog"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return str(cache_dir / "license_cache.json")
+def _find_watcher_py() -> Optional[str]:
+    """Dev fallback: watcher.py path next to gui.py or CWD."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    p1 = os.path.join(here, "watcher.py")
+    if os.path.exists(p1):
+        return p1
+    p2 = os.path.join(os.getcwd(), "watcher.py")
+    if os.path.exists(p2):
+        return p2
+    return None
 
-def _load_cached_key() -> str:
-    try:
-        p = _license_cache_path()
-        if os.path.exists(p):
-            data = json.load(open(p, "r", encoding="utf-8"))
-            return (data.get("license_key") or "").strip()
-    except Exception:
-        pass
-    return ""
+def _build_watcher_cmd() -> Optional[List[str]]:
+    """
+    Build the command to run the watcher.
+    - Frozen (one EXE): run this same EXE with --watcher
+    - Dev: run watcher.py with the current Python
+    """
+    if getattr(sys, "frozen", False):
+        # We run the same EXE with --watcher (watcher code is bundled/importable)
+        return [sys.executable, "--watcher"]
 
-def _store_cached_key(key: str) -> None:
-    try:
-        p = _license_cache_path()
-        data = {}
-        if os.path.exists(p):
-            try:
-                data = json.load(open(p, "r", encoding="utf-8")) or {}
-            except Exception:
-                data = {}
-        data["license_key"] = key
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+    # Dev fallback
+    wp = _find_watcher_py()
+    if wp:
+        return [sys.executable, wp]
+    return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# ROI Selector
+# ROI Selector (fullscreen drag overlay)
 # ────────────────────────────────────────────────────────────────────────────────
-
 class RoiSelector(tk.Toplevel):
     def __init__(self, master, screenshot: Image.Image, on_set):
         super().__init__(master)
@@ -247,7 +222,6 @@ class RoiSelector(tk.Toplevel):
 # ────────────────────────────────────────────────────────────────────────────────
 # Modern Dark UI + Triggers + License
 # ────────────────────────────────────────────────────────────────────────────────
-
 ACCENT = "#00ffc3"
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -269,6 +243,9 @@ class App(ctk.CTk):
 
         self._build_ui()
         self._populate_from_cfg()
+
+        # Hotkey: F8 quick reselect ROI
+        self.bind("<F8>", lambda e: self._select_roi())
 
     # UI layout
     def _build_ui(self):
@@ -292,6 +269,7 @@ class App(ctk.CTk):
 
         self.btn_start = ctk.CTkButton(self.sidebar, text="Start Watcher", command=self._toggle_watcher)
         self.btn_start.pack(padx=16, pady=6, fill="x")
+        # store defaults so we can restore without passing None
         self._start_fg_default = self.btn_start.cget("fg_color")
         self._start_hover_default = self.btn_start.cget("hover_color")
 
@@ -484,13 +462,19 @@ class App(ctk.CTk):
         self.triggers = list(c.get("triggers", []))
         self._refresh_trigger_list()
 
-        # Prefill license key from the shared cache
-        cached_key = _load_cached_key()
-        if cached_key:
-            self.lic_var.set(cached_key)
+        # Prefill license key from cache if present
+        try:
+            cache_path = os.path.join(os.path.dirname(__file__), "license_cache.json")
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                if cache.get("license_key"):
+                    self.lic_var.set(cache["license_key"])
+        except Exception:
+            pass
 
         # Initial license status (gates Start button)
-        self._on_check_license(startup=True)
+        self._on_check_license()
 
     # Triggers UI helpers
     def _refresh_trigger_list(self):
@@ -574,45 +558,24 @@ class App(ctk.CTk):
     # License helpers
     def _set_license_status(self, ok: bool, msg: str):
         color = "#00ffc3" if ok else "#ff7a7a"
-        details = ""
-        claims = license_client.get_cached_claims() or {}
-        if ok and claims:
-            exp = claims.get("exp")
-            plan = claims.get("plan", "?")
-            exp_h = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "?"
-            details = f" — plan={plan} exp={exp_h}"
-        self.lic_status.configure(text=f"License: {'VALID' if ok else 'INVALID'} — {msg}{details}", text_color=color)
+        self.lic_status.configure(text=f"License: {'VALID' if ok else 'INVALID'} — {msg}", text_color=color)
         self.btn_start.configure(state=("normal" if ok else "disabled"))
 
-    def _on_check_license(self, startup: bool = False):
-        key = (self.lic_var.get() or "").strip()
-        try:
-            ok, msg = license_client.require_valid(allow_online=False)
-            if not ok and key:
-                ok, msg = license_client.require_valid(allow_online=True, license_key=key)
-                if ok:
-                    _store_cached_key(key)
-        except Exception as e:
-            ok, msg = False, f"Check failed: {e}"
-        self._append_log(f"[LIC] {msg}\n")
+    def _on_check_license(self):
+        ok, msg = license_client.require_valid(allow_online=False)
+        if not ok:
+            ok, msg = license_client.require_valid(allow_online=True)
         self._set_license_status(ok, msg)
-        if (not startup) and (not ok):
-            messagebox.showwarning("License", msg)
 
     def _on_activate_license(self):
-        key = (self.lic_var.get() or "").strip()
-        if not key:
-            messagebox.showwarning("License", "Enter a license key first.")
-            return
-        self._append_log("[LIC] Activating…\n")
-        ok, msg = license_client.activate(key, timeout=20)
+        key = self.lic_var.get().strip()
+        ok, msg = license_client.activate_and_store(key) if hasattr(license_client, "activate_and_store") \
+            else license_client.activate(key)
+        self._set_license_status(ok, msg)
         if ok:
-            _store_cached_key(key)
             messagebox.showinfo("License", "Activation successful.")
         else:
             messagebox.showerror("License", f"Activation failed: {msg}")
-        self._append_log(f"[LIC] {msg}\n")
-        self._set_license_status(ok, msg)
 
     # Actions
     def _browse_tesseract(self):
@@ -664,10 +627,7 @@ class App(ctk.CTk):
 
     def _start_watcher(self):
         # LICENSE GATE
-        key = (self.lic_var.get() or "").strip()
-        ok, msg = license_client.require_valid(allow_online=False)
-        if not ok and key:
-            ok, msg = license_client.require_valid(allow_online=True, license_key=key)
+        ok, msg = license_client.require_valid(allow_online=True)
         if not ok:
             self._set_license_status(False, msg)
             messagebox.showerror("License", f"Not valid: {msg}")
@@ -676,27 +636,20 @@ class App(ctk.CTk):
         self.cfg = self._collect_cfg_from_ui()
         save_config(self.cfg)
 
-        # Resolve watcher command intelligently
-        cmd, run_cwd, note = _find_watcher_cmd()
-
-        # If last fallback is a missing CWD file, error out clearly
-        if cmd[-1].endswith("watcher.py") and not os.path.exists(cmd[-1]):
+        cmd = _build_watcher_cmd()
+        if not cmd:
             messagebox.showerror(
                 "Watcher",
                 "Cannot find watcher to launch.\n\n"
-                "Looked for:\n"
-                "  - watcher.exe next to the GUI\n"
-                "  - watcher.py next to the GUI\n"
-                "  - module 'watcher' via python -m watcher\n"
-                "  - watcher.py in the current working directory (fallback)\n\n"
-                "Fix: include watcher.exe or watcher.py alongside the app, or package watcher as a module."
+                "In dev: keep watcher.py next to gui.py.\n"
+                "For single EXE: build with PyInstaller and --hidden-import watcher."
             )
             return
 
         try:
             # UI: prepare
             self._clear_log()
-            self._append_log(f"[GUI] launching watcher … ({note})\n")
+            self._append_log(f"[GUI] launching: {' '.join(os.path.basename(x) for x in cmd)} …\n")
             self._set_status("Running watcher…")
             self.btn_start.configure(text="Stop Watcher", fg_color="#ff5a7a", hover_color="#ff7f97")
             self.btn_roi.configure(state="disabled")
@@ -710,21 +663,16 @@ class App(ctk.CTk):
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
 
-            # If we’re doing `-m watcher`, make sure app dir is importable
-            if len(cmd) >= 3 and cmd[1:3] == ["-m", "watcher"]:
-                appdir = _app_dir()
-                env["PYTHONPATH"] = (appdir + os.pathsep + env.get("PYTHONPATH", "")) if appdir else env.get("PYTHONPATH", "")
-
             self.proc = subprocess.Popen(
                 cmd,
-                cwd=run_cwd,
+                cwd=_app_dir(),                 # launch from app folder
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=1,                 # line-buffered (with text mode)
-                universal_newlines=True,   # text mode
-                encoding="utf-8",          # matches PYTHONIOENCODING
-                errors="replace",          # replace invalid bytes
-                env=env,                   # pass env to child
+                bufsize=1,                      # line-buffered
+                universal_newlines=True,        # text mode
+                encoding="utf-8",
+                errors="replace",
+                env=env,
             )
 
             # Start log reader thread
@@ -788,10 +736,11 @@ class App(ctk.CTk):
         self.status.configure(text=s)
 
     def _reset_controls(self):
+        # restore button text/colors safely (avoid fg_color=None)
         kwargs = {"text": "Start Watcher"}
-        if getattr(self, "_start_fg_default", None) not in (None, "None"):
+        if self._start_fg_default not in (None, "None"):
             kwargs["fg_color"] = self._start_fg_default
-        if getattr(self, "_start_hover_default", None) not in (None, "None"):
+        if self._start_hover_default not in (None, "None"):
             kwargs["hover_color"] = self._start_hover_default
         self.btn_start.configure(**kwargs)
         self.btn_roi.configure(state="normal")
@@ -833,6 +782,31 @@ class App(ctk.CTk):
         self.destroy()
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Watcher-mode entry (single-EXE): run watcher when invoked as: ArkWatchdog.exe --watcher
+# ────────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__" and "--watcher" in sys.argv:
+    # Run the watcher inside this process (child mode). Keep it as a separate
+    # process from the GUI for clean log piping and stop/kill support.
+    if _HAS_WATCHER_MODULE:
+        # Ensure watcher sees a clean argv
+        sys.argv = [sys.argv[0]]
+        if hasattr(_watcher_module, "main"):
+            _watcher_module.main()
+        else:
+            import runpy
+            runpy.run_module("watcher", run_name="__main__")
+    else:
+        # Dev fallback: execute watcher.py directly if present
+        import runpy
+        wp = _find_watcher_py()
+        if not wp:
+            sys.stderr.write("watcher.py not found\n")
+            sys.exit(2)
+        runpy.run_path(wp, run_name="__main__")
+    sys.exit(0)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# GUI entry
+# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     App().mainloop()
