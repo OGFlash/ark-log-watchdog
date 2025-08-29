@@ -17,6 +17,24 @@ from bundled_tesseract import use_bundled_tesseract
 
 import license_client
 
+# Force PyInstaller to bundle these modules even if we only import them dynamically.
+try:
+    import watcher as _watcher_module  # bundled watcher
+    _HAS_WATCHER_MODULE = True
+except Exception:
+    _watcher_module = None
+    _HAS_WATCHER_MODULE = False
+
+# These are usually imported by watcher, but add hints for the freezer:
+try:
+    import ocr  # noqa: F401
+except Exception:
+    pass
+try:
+    import discord_notifier  # noqa: F401
+except Exception:
+    pass
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Try to import watcher so PyInstaller bundles it. (We still launch a child proc)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -96,42 +114,6 @@ def save_config(cfg: Dict[str, Any]) -> None:
             yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
     except Exception as e:
         messagebox.showerror("Config error", f"Failed to write config.yaml:\n{e}")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Helpers: app dir & watcher command (single-EXE)
-# ────────────────────────────────────────────────────────────────────────────────
-def _app_dir() -> str:
-    """Folder of the running app (handles PyInstaller and script)."""
-    if getattr(sys, "frozen", False):  # PyInstaller onefile
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-def _find_watcher_py() -> Optional[str]:
-    """Dev fallback: watcher.py path next to gui.py or CWD."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    p1 = os.path.join(here, "watcher.py")
-    if os.path.exists(p1):
-        return p1
-    p2 = os.path.join(os.getcwd(), "watcher.py")
-    if os.path.exists(p2):
-        return p2
-    return None
-
-def _build_watcher_cmd() -> Optional[List[str]]:
-    """
-    Build the command to run the watcher.
-    - Frozen (one EXE): run this same EXE with --watcher
-    - Dev: run watcher.py with the current Python
-    """
-    if getattr(sys, "frozen", False):
-        # We run the same EXE with --watcher (watcher code is bundled/importable)
-        return [sys.executable, "--watcher"]
-
-    # Dev fallback
-    wp = _find_watcher_py()
-    if wp:
-        return [sys.executable, wp]
-    return None
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ROI Selector (fullscreen drag overlay)
@@ -236,6 +218,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.cfg = load_config()
+        exe, td = use_bundled_tesseract(self.cfg)
         # Prefer a bundled Tesseract if present (sets cfg["tesseract_cmd"] automatically)
         use_bundled_tesseract(self.cfg)
         self.proc: Optional[subprocess.Popen] = None
@@ -629,7 +612,6 @@ class App(ctk.CTk):
             self._stop_watcher()
 
     def _start_watcher(self):
-        # LICENSE GATE
         ok, msg = license_client.require_valid(allow_online=True)
         if not ok:
             self._set_license_status(False, msg)
@@ -639,53 +621,41 @@ class App(ctk.CTk):
         self.cfg = self._collect_cfg_from_ui()
         save_config(self.cfg)
 
-        cmd = _build_watcher_cmd()
-        if not cmd:
-            messagebox.showerror(
-                "Watcher",
-                "Cannot find watcher to launch.\n\n"
-                "In dev: keep watcher.py next to gui.py.\n"
-                "For single EXE: build with PyInstaller and --hidden-import watcher."
-            )
-            return
-
         try:
-            # UI: prepare
             self._clear_log()
-            self._append_log(f"[GUI] launching: {' '.join(os.path.basename(x) for x in cmd)} …\n")
+            self._append_log("[GUI] launching: ArkWatchdog.exe --watcher …\n")
             self._set_status("Running watcher…")
             self.btn_start.configure(text="Stop Watcher", fg_color="#ff5a7a", hover_color="#ff7f97")
             self.btn_roi.configure(state="disabled")
             self.btn_save.configure(state="disabled")
             self.btn_test.configure(state="disabled")
-
-            # Ensure clean reader state
             self.stop_reader.clear()
 
-            # Force UTF-8 from child; never crash on weird bytes
+            # Launch the same EXE (frozen) or same script (dev) with --watcher
+            if getattr(sys, "frozen", False):
+                args = [sys.executable, "--watcher"]
+            else:
+                args = [sys.executable, os.path.abspath(sys.argv[0]), "--watcher"]
+
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
-            # Ensure child sees bundled Tesseract (if present)
-            # Ensure child sees the tessdata directory if we’re using a bundled exe
-            if self.cfg.get("tesseract_cmd"):
-                tdir = os.path.dirname(self.cfg["tesseract_cmd"])
-                env.setdefault("TESSDATA_PREFIX", tdir)
-                # Optional: put Tesseract folder at front of PATH so any tools that rely on PATH also work
-                env["PATH"] = tdir + os.pathsep + env.get("PATH", "")
+
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
             self.proc = subprocess.Popen(
-                cmd,
-                cwd=_app_dir(),                 # launch from app folder
+                args,
+                cwd=os.getcwd(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=1,                      # line-buffered
-                universal_newlines=True,        # text mode
+                bufsize=1,
+                universal_newlines=True,
                 encoding="utf-8",
                 errors="replace",
                 env=env,
+                creationflags=creationflags,
             )
-
-            # Start log reader thread
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
@@ -693,6 +663,7 @@ class App(ctk.CTk):
             self._append_log(f"[GUI] failed to start watcher: {e}\n")
             self._set_status("Failed to start.")
             self._reset_controls()
+
 
     def _stop_watcher(self):
         if self.proc is None:
@@ -794,29 +765,52 @@ class App(ctk.CTk):
 # ────────────────────────────────────────────────────────────────────────────────
 # Watcher-mode entry (single-EXE): run watcher when invoked as: ArkWatchdog.exe --watcher
 # ────────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__" and "--watcher" in sys.argv:
-    # Run the watcher inside this process (child mode). Keep it as a separate
-    # process from the GUI for clean log piping and stop/kill support.
-    if _HAS_WATCHER_MODULE:
-        # Ensure watcher sees a clean argv
-        sys.argv = [sys.argv[0]]
-        if hasattr(_watcher_module, "main"):
-            _watcher_module.main()
-        else:
-            import runpy
-            runpy.run_module("watcher", run_name="__main__")
-    else:
-        # Dev fallback: execute watcher.py directly if present
-        import runpy
-        wp = _find_watcher_py()
-        if not wp:
-            sys.stderr.write("watcher.py not found\n")
-            sys.exit(2)
-        runpy.run_path(wp, run_name="__main__")
-    sys.exit(0)
+if __name__ == "__main__":
+    import argparse, importlib, traceback
 
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--watcher", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    if args.watcher:
+        # Run the watcher inside this process (separate process is created by GUI via --watcher)
+        try:
+            if _HAS_WATCHER_MODULE and hasattr(_watcher_module, "main"):
+                _watcher_module.main()
+            else:
+                # last-chance dynamic import (works in dev too)
+                mod = importlib.import_module("watcher")
+                mod.main()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"[WATCHER] failed to run: {e}", flush=True)
+            traceback.print_exc()
+            # non-zero so the GUI can log an error instead of “code None”
+            sys.exit(2)
+    else:
+        App().mainloop()
 # ────────────────────────────────────────────────────────────────────────────────
 # GUI entry
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    App().mainloop()
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--watcher", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    if args.watcher:
+        try:
+            import watcher
+        except Exception as e:
+            print("Failed to import watcher module:", e, flush=True)
+            sys.exit(1)
+        try:
+            watcher.main()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print("Watcher crashed:", e, flush=True)
+            sys.exit(1)
+    else:
+        App().mainloop()
